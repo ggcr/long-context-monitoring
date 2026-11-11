@@ -834,7 +834,8 @@ def _run(args: argparse.Namespace, runlog: RunLog) -> int:
     elif getattr(args, "base_url", None):
         raise SystemExit(f"--base-url is only used by --backend {VLLM_BACKEND}")
 
-    if getattr(args, "chunk_concurrency", 1) > 1 and not args.dry_run:
+    if (getattr(args, "chunk_concurrency", 1) > 1 and not args.dry_run
+            and getattr(args, "backend", OPENROUTER_BACKEND) != VLLM_BACKEND):
         print(console.yellow(
             f"note: --chunk-concurrency {args.chunk_concurrency} scores chunks "
             f"on worker threads, so the "

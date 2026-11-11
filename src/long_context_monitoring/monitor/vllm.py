@@ -11,7 +11,10 @@ for retries, response parsing and tool turns, and changes only what differs:
   than OpenRouter's ``reasoning`` object, which vLLM would silently ignore;
 - no OpenRouter ``provider`` routing object or ``:nitro`` slug rewriting —
   there is exactly one host, so a provider pin is refused instead of dropped;
-- every call costs $0.00, so the cost gate and the recorded cost stay honest.
+- every call costs $0.00, so the cost gate and the recorded cost stay honest;
+- no timeouts by default. The OpenRouter limits exist so a stuck call is not
+  paid for twice; a local server bills nothing, and a long non-streamed call
+  (a ~100k-token chunk at high effort) legitimately sends nothing until done.
 
 The context window is not taken from the static table: :func:`served_model_info`
 reads ``max_model_len`` from ``GET {base_url}/models``, so chunk budgets match
@@ -112,8 +115,13 @@ class VLLMClient(OpenRouterClient):
     """:class:`OpenRouterClient` pointed at a vLLM server (see module docstring)."""
 
     def __init__(self, base_url: str | None = None, *,
-                 api_key: str | None = None, **kwargs: object) -> None:
+                 api_key: str | None = None, timeout: float | None = None,
+                 **kwargs: object) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
+        # None blocks until the server answers: no socket timeout and no
+        # wall-clock deadline (whatever the caller passed as hard_timeout).
+        self.timeout = timeout  # type: ignore[assignment]
+        self.hard_timeout = None
         self.base_url = resolve_base_url(base_url)
         self.url = f"{self.base_url}/chat/completions"
         # Optional: a server started without --api-key accepts any request.
@@ -121,6 +129,9 @@ class VLLMClient(OpenRouterClient):
 
     def _require_key(self) -> str:
         return self.api_key or ""
+
+    def _timeout_for(self, body_bytes: int) -> float | None:  # type: ignore[override]
+        return self.timeout
 
     def _headers(self, key: str) -> dict:
         return {"Content-Type": "application/json", **_auth_headers(key)}
