@@ -37,6 +37,8 @@ from long_context_monitoring.monitor.llm import (DEFAULT_MODEL, DEFAULT_REASONIN
 from long_context_monitoring.monitor.openai_direct import (OPENAI_DIRECT_BACKEND,
                                        OpenAIDirectMonitorClient,
                                        direct_model_name)
+from long_context_monitoring.monitor.vllm import (VLLM_BACKEND, VLLMClient,
+                                                  resolve_base_url, served_model_info)
 from long_context_monitoring.monitor.recording import (Journal, assert_batch_configuration_compatible,
                                    assert_batch_visibility_compatible,
                                    make_run_dir, update_batch_manifest,
@@ -217,6 +219,8 @@ def _build_request(args, traj: Trajectory) -> tuple[MonitorRequest, list, list]:
             args.model, getattr(args, "quantization", None)
         ),
         backend=getattr(args, "backend", OPENROUTER_BACKEND),
+        context_tokens=getattr(args, "context_tokens", None),
+        base_url=getattr(args, "base_url", None),
         chunk_concurrency=max(1, getattr(args, "chunk_concurrency", 1) or 1),
         monitor_template=getattr(args, "monitor_template", None) or DEFAULT_MONITOR_TEMPLATE,
         run_metadata={
@@ -263,7 +267,9 @@ def _print_summary(request: MonitorRequest, all_events: list, visible: list,
     # each chunk at its own model's rate rather than the nominal request model's
     # (estimate_cost_usd is linear in tokens, so this equals the old bulk
     # calculation whenever every plan shares one model).
-    est_cost = sum(
+    # A self-hosted vLLM server bills nothing, so its estimate is exactly 0
+    # rather than the table's conservative default for an unlisted model.
+    est_cost = 0.0 if request.backend == VLLM_BACKEND else sum(
         estimate_cost_usd(plan.model or request.model, plan.prompt_tokens_est,
                           request.max_output_tokens)
         for plan in scored_plans
@@ -350,13 +356,15 @@ def _print_dry_run(plans: list[ChunkPlan]) -> None:
         print(plan.user_prompt)
 
 
-def _make_client(backend: str):
+def _make_client(backend: str, base_url: str | None = None):
     """The LLM client for ``backend``, under the monitor's request deadline.
 
-    Both clients honour the same ``LLMClient.complete`` contract, so every
+    Every client honours the same ``LLMClient.complete`` contract, so every
     strategy is unchanged by the choice.
     """
 
+    if backend == VLLM_BACKEND:
+        return VLLMClient(base_url, hard_timeout=MONITOR_REQUEST_DEADLINE_SECONDS)
     if backend == OPENAI_DIRECT_BACKEND:
         return OpenAIDirectMonitorClient(
             hard_timeout=MONITOR_REQUEST_DEADLINE_SECONDS
@@ -389,7 +397,7 @@ def _score_target(args, request: MonitorRequest, strategy,
         )
 
     journal = Journal(run_dir / "journal.jsonl")
-    client = _make_client(request.backend)
+    client = _make_client(request.backend, request.base_url)
     try:
         result = strategy.run(request, client, journal, plans=plans)
     except (ContextBudgetError, LLMError, ScoreParseError, ResumeSettingsError) as error:
@@ -558,11 +566,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--backend",
         default=OPENROUTER_BACKEND,
-        choices=[OPENROUTER_BACKEND, OPENAI_DIRECT_BACKEND],
+        choices=[OPENROUTER_BACKEND, OPENAI_DIRECT_BACKEND, VLLM_BACKEND],
         help="transport for monitor calls (default %(default)s). "
              f"'{OPENAI_DIRECT_BACKEND}' sends an openai/* model straight to "
              "api.openai.com, skipping OpenRouter's routing hop; it needs "
-             "OPENAI_API_KEY and reports an estimated, not a billed, cost",
+             "OPENAI_API_KEY and reports an estimated, not a billed, cost. "
+             f"'{VLLM_BACKEND}' sends --model to a self-hosted vLLM server at "
+             "--base-url, sizes chunks from its /v1/models max_model_len, and "
+             "costs $0",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help=f"OpenAI-compatible /v1 root for --backend {VLLM_BACKEND} "
+             "(default: $BASE_URL, e.g. http://localhost:8000/v1). "
+             "Optional key: $VLLM_API_KEY",
     )
     parser.add_argument(
         "--chunk-concurrency",
@@ -794,6 +812,27 @@ def _run(args: argparse.Namespace, runlog: RunLog) -> int:
                 f"--backend {OPENAI_DIRECT_BACKEND} needs OPENAI_API_KEY; set it "
                 "in the environment or the repo-local .env"
             )
+
+    # A vLLM server reports its own window; read it before planning so chunk
+    # budgets match the --max-model-len it was started with. The query is
+    # local and free, so a dry run makes it too (its plan depends on it).
+    if getattr(args, "backend", OPENROUTER_BACKEND) == VLLM_BACKEND:
+        if getattr(args, "provider", None) or getattr(args, "quantization", None):
+            raise SystemExit(
+                f"--backend {VLLM_BACKEND} serves one model from one host; "
+                "--provider/--quantization are OpenRouter routing pins"
+            )
+        try:
+            args.base_url = resolve_base_url(getattr(args, "base_url", None))
+            served = served_model_info(args.base_url, args.model)
+        except LLMError as error:
+            raise SystemExit(str(error)) from error
+        args.context_tokens = served.max_model_len
+        print(console.kv(
+            "Server", f"{args.base_url}  ·  max_model_len {served.max_model_len}",
+            width=11))
+    elif getattr(args, "base_url", None):
+        raise SystemExit(f"--base-url is only used by --backend {VLLM_BACKEND}")
 
     if getattr(args, "chunk_concurrency", 1) > 1 and not args.dry_run:
         print(console.yellow(

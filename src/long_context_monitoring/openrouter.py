@@ -469,6 +469,10 @@ class OpenRouterClient:
     provider's message so failures are legible.
     """
 
+    # Chat-completions endpoint every POST goes to. A subclass serving the same
+    # OpenAI-shaped API elsewhere (``VLLMClient``) overrides it per instance.
+    url: str = OPENROUTER_URL
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -595,7 +599,7 @@ class OpenRouterClient:
         HTTP 200 with an ``error`` object, so that shape is raised here as an
         ``LLMError`` and retried by the caller exactly like an HTTP 429.
         """
-        request = urllib.request.Request(OPENROUTER_URL, data=body, headers=headers)
+        request = urllib.request.Request(self.url, data=body, headers=headers)
         socket_timeout = timeout or self.timeout
         deadline = None
         if self.hard_timeout is not None:

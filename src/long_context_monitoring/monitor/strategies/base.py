@@ -202,8 +202,8 @@ class MonitorRequest:
     # never pooled.
     task_context_mode: str = FULL_TASK_CONTEXT_MODE
     chunk_concurrency: int = 1
-    # Which transport served the calls: "openrouter" (the default) or
-    # "openai-direct". Recorded in every result and part of a batch's
+    # Which transport served the calls: "openrouter" (the default),
+    # "openai-direct", or "vllm". Recorded in every result and part of a batch's
     # compatibility key — the same model served through a router and served
     # first-party is not the same monitor condition, so the two never pool.
     backend: str = OPENROUTER_BACKEND
@@ -212,6 +212,20 @@ class MonitorRequest:
     # render through ``build_chunk_prompt`` honour it; the CLI refuses any
     # other strategy with a non-default template rather than ignoring it.
     monitor_template: str = DEFAULT_MONITOR_TEMPLATE
+    # The monitor model's context window as reported by the serving host
+    # (vLLM's ``max_model_len``). None falls back to the static per-model table,
+    # which is right for OpenRouter/OpenAI where the window is a known constant.
+    context_tokens: int | None = None
+    # The OpenAI-compatible ``/v1`` root a self-hosted backend (vLLM) serves
+    # from; None for hosted backends whose endpoint is fixed.
+    base_url: str | None = None
+
+    @property
+    def context_window(self) -> int:
+        """Tokens the monitor model can hold: the host's report, else the table."""
+        if self.context_tokens is not None:
+            return self.context_tokens
+        return model_context_tokens(self.model)
 
     @property
     def objectives_provided(self) -> bool:
@@ -261,7 +275,7 @@ def chunk_transcript_budget(request: MonitorRequest,
     transcript approaches the window — and when a split is unavoidable, chunks
     pack nearly full rather than at 60%.
     """
-    window = model_context_tokens(request.model)
+    window = request.context_window
     target = window if request.chunk_target_tokens is None else min(
         request.chunk_target_tokens, window)
     overhead = prompt_overhead_tokens(request, view_info=view_info)
@@ -789,6 +803,12 @@ def build_result(request: MonitorRequest, chunks: list[dict],
             "provided" if request.objectives_provided else "blind"
         ),
     }
+    if request.context_tokens is not None:
+        # Only a self-hosted backend reports its window at run time; record it
+        # so a result shows the budget that sized its chunks.
+        config["context_tokens"] = request.context_tokens
+    if request.base_url is not None:
+        config["base_url"] = request.base_url
     if config_extra:
         config.update(config_extra)
     config["prompt_version"] = prompt_version_for(config.get("prompt_templates"))

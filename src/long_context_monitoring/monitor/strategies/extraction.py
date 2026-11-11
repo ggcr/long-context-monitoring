@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 
-from long_context_monitoring.monitor.llm import model_context_tokens
 from long_context_monitoring.monitor.render import estimate_tokens, render_units
 from long_context_monitoring.monitor.strategies.base import (
     MIN_CHUNK_BUDGET_TOKENS,
@@ -34,7 +33,7 @@ def stage_prompt_budget(request: MonitorRequest) -> int:
     If wrong: a stage sends a prompt the model window cannot hold and the
     call fails or is silently truncated by the provider.
     """
-    window = model_context_tokens(request.model)
+    window = request.context_window
     target = window if request.chunk_target_tokens is None else min(
         request.chunk_target_tokens, window)
     return int(target * WINDOW_FILL) - request.max_output_tokens
