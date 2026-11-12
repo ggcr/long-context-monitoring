@@ -220,6 +220,13 @@ def _update_index(index_path: Path, result: MonitorResult, run_dir: Path) -> Non
     )
 
 
+def _write_atomic(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` so a reader sees the old file or the whole new one."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def write_records(result: MonitorResult, run_dir: str | Path) -> Path:
     """Write result.json + report.md into ``run_dir`` and update the index.
 
@@ -228,11 +235,11 @@ def write_records(result: MonitorResult, run_dir: str | Path) -> Path:
     """
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "result.json").write_text(
-        json.dumps(asdict(result), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    (run_dir / "report.md").write_text(build_report(result), encoding="utf-8")
+    # result.json marks a run as finished (a sweep skips arms that have one),
+    # so it must never exist half-written: write a temporary file, then rename.
+    _write_atomic(run_dir / "result.json",
+                  json.dumps(asdict(result), indent=2, ensure_ascii=False) + "\n")
+    _write_atomic(run_dir / "report.md", build_report(result))
     _update_index(run_dir.parent / "index.json", result, run_dir)
     return run_dir
 

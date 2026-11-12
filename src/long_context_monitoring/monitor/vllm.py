@@ -29,6 +29,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
 from long_context_monitoring.openrouter import (
@@ -109,6 +110,43 @@ def served_model_info(base_url: str, model: str, *, api_key: str | None = None,
         f"{base_url} does not serve {model!r}; pass one of its models with "
         f"--model: {names}"
     )
+
+
+def count_tokens(base_url: str, model: str, texts: list[str], *,
+                 api_key: str | None = None, workers: int = 8,
+                 timeout: float = 120.0) -> list[int]:
+    """Exact token counts for ``texts`` from vLLM's ``POST /tokenize``.
+
+    No special tokens are added, so counts of separately tokenized pieces sum
+    to within a token per join of the joined text. ``/tokenize`` sits at the
+    server root, beside ``/v1``.
+    """
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[: -len("/v1")]
+    headers = {"Content-Type": "application/json",
+               **_auth_headers(api_key or os.environ.get(API_KEY_ENV))}
+
+    def one(text: str) -> int:
+        body = json.dumps({"model": model, "prompt": text,
+                           "add_special_tokens": False}).encode("utf-8")
+        request = urllib.request.Request(f"{root}/tokenize", data=body, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            raise LLMError(f"POST {root}/tokenize failed with HTTP {error.code}") from error
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as error:
+            raise LLMError(f"could not tokenize via {root}/tokenize: {error}") from error
+        count = data.get("count") if isinstance(data, dict) else None
+        if not isinstance(count, int):
+            raise LLMError(f"unexpected /tokenize response from {root}: {str(data)[:200]}")
+        return count
+
+    if not texts:
+        return []
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(texts)))) as pool:
+        return list(pool.map(one, texts))
 
 
 class VLLMClient(OpenRouterClient):
@@ -211,6 +249,7 @@ __all__ = [
     "ServedModel",
     "VLLMClient",
     "VLLM_BACKEND",
+    "count_tokens",
     "resolve_base_url",
     "served_model_info",
 ]

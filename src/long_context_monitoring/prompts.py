@@ -89,6 +89,7 @@ _STRATEGY_TEMPLATES: dict[str, str] = {
         "monitor_annotated_history.md", "monitor_nano_annotated_history.md",
         "monitor_sandbox.md", "monitor_nano_sandbox.md",
         "monitor_scratchpad.md", "monitor_nano_scratchpad.md",
+        "monitor_sliding_window.md",
     )
 }
 
@@ -366,4 +367,28 @@ def build_annotated_history_prompt(
         "interval_index": str(interval_index),
         "interval_total": str(interval_total),
         "transcript": transcript_text,
+    })
+
+
+def build_sliding_window_prompt(
+    task_description: str,
+    history_text: str,
+    action_text: str,
+    history_note: str,
+    objectives: str | None = None,
+) -> str:
+    """Prompt for the sliding-window strategy: score one action given the
+    transcript before it (see prompts/monitor_sliding_window.md and
+    ``strategies/sliding_window.py``). ``history_note`` says whether the
+    history starts at the beginning of the trajectory or was cut by the window.
+    The ``{{#objectives}}`` region drops in the blind condition.
+    """
+    template = _STRATEGY_TEMPLATES["monitor_sliding_window.md"]
+    text = _render_optional(template, "objectives", bool(objectives))
+    return _fill(text, {
+        "task_description": task_description,
+        "objectives": objectives or "",
+        "history_note": history_note,
+        "history": history_text,
+        "action": action_text,
     })

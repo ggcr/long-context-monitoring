@@ -14,6 +14,7 @@ The loader records template hashes with each new monitor result.
 | `monitor_annotated_history.md` | Scoring with a carried evidence record. |
 | `monitor_sandbox.md` | Monitoring through transcript inspection tools. |
 | `monitor_scratchpad.md` | Transcript inspection with a private scratchpad. |
+| `monitor_sliding_window.md` | Scoring one action with the transcript before it (`sliding-window`). |
 | `monitor_nano*.md` | Alternate scoring templates selected with `--monitor-template monitor_nano.md`. |
 
 The monitor receives the host task and the events allowed by its visibility

@@ -155,7 +155,7 @@ def _task_context(args, traj: Trajectory, visible: list) -> tuple[str, str, dict
 # Every other strategy builds at least one prompt its own way; rather than
 # let a non-default template be silently ignored there, the CLI refuses it.
 TEMPLATE_AWARE_STRATEGIES = frozenset({
-    "whole", "summaries-only", "cumulative", "sliding-window", "intervals",
+    "whole", "summaries-only", "cumulative", "intervals",
     "pairs", "three-view", "final-ablation",
     # These four build their own prompts but select a variant per scoring
     # template (``prompts.STRATEGY_TEMPLATE_VARIANTS``); hierarchical and
@@ -177,6 +177,21 @@ def _resolved_effort(effort: str | None) -> str | None:
     """
 
     return None if effort == "none" else effort
+
+
+def _requested_effort(args) -> str | None:
+    """The effort to send: ``--reasoning-effort`` when given, else the
+    strategy's ``default_reasoning_effort`` (sliding-window: none, the model's
+    default applies), else the house default."""
+    effort = getattr(args, "reasoning_effort", None)
+    if effort is not None:
+        return _resolved_effort(effort)
+    try:
+        strategy = get_strategy(getattr(args, "strategy", None) or DEFAULT_STRATEGY)
+    except KeyError:
+        strategy = None
+    return _resolved_effort(
+        getattr(strategy, "default_reasoning_effort", DEFAULT_REASONING_EFFORT))
 
 
 def _build_request(args, traj: Trajectory) -> tuple[MonitorRequest, list, list]:
@@ -211,7 +226,7 @@ def _build_request(args, traj: Trajectory) -> tuple[MonitorRequest, list, list]:
         ),
         ensemble_base_strategy=getattr(args, "ensemble_base_strategy", None) or "intervals",
         internal_repetitions=getattr(args, "internal_reps", 1) or 1,
-        reasoning_effort=_resolved_effort(getattr(args, "reasoning_effort", None)),
+        reasoning_effort=_requested_effort(args),
         provider=default_provider_order(
             args.model, getattr(args, "provider", None)
         ),
@@ -309,7 +324,13 @@ def _print_summary(request: MonitorRequest, all_events: list, visible: list,
         f"{total - scored_chunks} skipped as no-action)",
         width=11,
     ))
-    for plan, tokens, scored in zip(plans, per_chunk_tokens, per_chunk_scored, strict=True):
+    listed = list(zip(plans, per_chunk_tokens, per_chunk_scored, strict=True))
+    if len(listed) > 30:
+        ordered = sorted(per_chunk_tokens)
+        print(f"             {len(listed)} prompts: ~{ordered[0]} / ~{ordered[len(ordered) // 2]}"
+              f" / ~{ordered[-1]} prompt tokens (min / median / max)")
+        listed = []
+    for plan, tokens, scored in listed:
         scope = ""
         if plan.view_total > 1:
             scope = (f" [{plan.view_label}, "
@@ -338,12 +359,22 @@ def _print_summary(request: MonitorRequest, all_events: list, visible: list,
     return total_input_est, est_cost
 
 
-def _print_dry_run(plans: list[ChunkPlan]) -> None:
-    """Print every chunk's full rendered prompt (no network, no files)."""
+def _print_dry_run(plans: list[ChunkPlan], limit: int | None = None) -> None:
+    """Print every chunk's full rendered prompt (no network, no files).
+
+    ``limit`` (a strategy's ``dry_run_prompt_limit``) prints only the first,
+    middle and last few of a strategy that plans hundreds of window-sized prompts.
+    """
     print()
     print(console.header("DRY RUN: rendered chunk prompts (no network)"))
     total = len(plans)
-    for plan in plans:
+    shown = plans
+    if limit is not None and total > limit:
+        picks = sorted({0, total // 2, total - 1})
+        shown = [plans[i] for i in picks]
+        print(console.dim(f"  showing {len(shown)} of {total} prompts "
+                          f"(chunks {', '.join(str(plans[i].index) for i in picks)})"))
+    for plan in shown:
         skip = ("" if plan.has_actions
                 else console.dim("  [skipped: no agent actions — scored 0, not sent]"))
         scope = ""
@@ -595,10 +626,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--reasoning-effort",
-        default=DEFAULT_REASONING_EFFORT,
+        default=None,
         choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-        help="OpenRouter reasoning.effort for each monitor call "
-             f"(default {DEFAULT_REASONING_EFFORT}; pass 'none' to send no effort)",
+        help="reasoning effort for each monitor call (default "
+             f"{DEFAULT_REASONING_EFFORT}, except sliding-window, which sends none; "
+             "pass 'none' to send no effort)",
     )
     parser.add_argument(
         "--provider",
@@ -793,6 +825,32 @@ def _assert_batch_compatible(args: argparse.Namespace, request: MonitorRequest,
         raise SystemExit(str(error)) from error
 
 
+def _resolve_vllm_server(args: argparse.Namespace) -> None:
+    """For --backend vllm, find the server and read its context window.
+
+    A vLLM server reports its own window; read it before planning so chunk
+    budgets match the --max-model-len it was started with. The query is local
+    and free, so a dry run makes it too (its plan depends on it).
+    """
+    if getattr(args, "backend", OPENROUTER_BACKEND) == VLLM_BACKEND:
+        if getattr(args, "provider", None) or getattr(args, "quantization", None):
+            raise SystemExit(
+                f"--backend {VLLM_BACKEND} serves one model from one host; "
+                "--provider/--quantization are OpenRouter routing pins"
+            )
+        try:
+            args.base_url = resolve_base_url(getattr(args, "base_url", None))
+            served = served_model_info(args.base_url, args.model)
+        except LLMError as error:
+            raise SystemExit(str(error)) from error
+        args.context_tokens = served.max_model_len
+        print(console.kv(
+            "Server", f"{args.base_url}  ·  max_model_len {served.max_model_len}",
+            width=11))
+    elif getattr(args, "base_url", None):
+        raise SystemExit(f"--base-url is only used by --backend {VLLM_BACKEND}")
+
+
 def _run(args: argparse.Namespace, runlog: RunLog) -> int:
     """Plan, gate, and score the sweep, with ``runlog`` capturing the console."""
     # Repo-local .env supplies the backend's API key when the shell has not
@@ -813,26 +871,7 @@ def _run(args: argparse.Namespace, runlog: RunLog) -> int:
                 "in the environment or the repo-local .env"
             )
 
-    # A vLLM server reports its own window; read it before planning so chunk
-    # budgets match the --max-model-len it was started with. The query is
-    # local and free, so a dry run makes it too (its plan depends on it).
-    if getattr(args, "backend", OPENROUTER_BACKEND) == VLLM_BACKEND:
-        if getattr(args, "provider", None) or getattr(args, "quantization", None):
-            raise SystemExit(
-                f"--backend {VLLM_BACKEND} serves one model from one host; "
-                "--provider/--quantization are OpenRouter routing pins"
-            )
-        try:
-            args.base_url = resolve_base_url(getattr(args, "base_url", None))
-            served = served_model_info(args.base_url, args.model)
-        except LLMError as error:
-            raise SystemExit(str(error)) from error
-        args.context_tokens = served.max_model_len
-        print(console.kv(
-            "Server", f"{args.base_url}  ·  max_model_len {served.max_model_len}",
-            width=11))
-    elif getattr(args, "base_url", None):
-        raise SystemExit(f"--base-url is only used by --backend {VLLM_BACKEND}")
+    _resolve_vllm_server(args)
 
     if (getattr(args, "chunk_concurrency", 1) > 1 and not args.dry_run
             and getattr(args, "backend", OPENROUTER_BACKEND) != VLLM_BACKEND):
@@ -883,7 +922,7 @@ def _run(args: argparse.Namespace, runlog: RunLog) -> int:
         # No sink for a dry run: the rendered prompts are the whole transcript,
         # and a real run already persists them as chunk-NN.prompt.txt.
         for _request, chunk_plans in plans:
-            _print_dry_run(chunk_plans)
+            _print_dry_run(chunk_plans, getattr(strategy, "dry_run_prompt_limit", None))
         return 0
 
     if args.results_dir is None:
