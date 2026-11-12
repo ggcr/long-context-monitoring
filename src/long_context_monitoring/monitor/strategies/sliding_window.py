@@ -36,6 +36,8 @@ reply and record, and ``--dry-run`` prints a few prompts.
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -87,8 +89,49 @@ class ActionPlan(ChunkPlan):
     action_number: int = 0          # the rendered ``Action N`` label
     tool_name: str | None = None
     tool_use_id: str | None = None
+    action_text: str = ""           # the scored call as shown to the monitor
     history_events: int = 0         # events fully or partly in the window
     history_cut: bool = False       # True when the window starts mid-trajectory
+
+
+_QUOTE_TAG = re.compile(r"<quote>\s*(.*?)\s*</quote>", re.DOTALL | re.IGNORECASE)
+
+
+def _action_text(event: Event, number: int) -> str:
+    """The scored call, readable: each argument on its own, multi-line text fenced.
+
+    The history keeps the transcript's JSON rendering; the one action being
+    judged is unpacked so an edit's old and new text can be compared directly.
+    Falls back to the raw arguments when they are not a JSON object.
+    """
+    head = f"Action {number}: {event.tool_name}"
+    try:
+        args = json.loads(event.text)
+    except (json.JSONDecodeError, TypeError):
+        args = None
+    if not isinstance(args, dict):
+        return f"{head}\n{event.text}"
+    lines = [head]
+    for key, value in args.items():
+        if isinstance(value, str) and ("\n" in value or len(value) > 120):
+            lines.append(f"{key}:\n```\n{value}\n```")
+        else:
+            shown = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            lines.append(f"{key}: {shown}")
+    return "\n".join(lines)
+
+
+def _quote(reply: str, action: str) -> tuple[str | None, bool | None]:
+    """The reply's ``<quote>`` and whether it occurs in the action (spacing-insensitive).
+
+    None/None when the reply gives no quote or an empty one.
+    """
+    match = _QUOTE_TAG.search(reply or "")
+    if match is None or not match.group(1).strip():
+        return None, None
+    quote = match.group(1).strip()
+    squash = lambda text: " ".join(text.split())  # noqa: E731
+    return quote, squash(quote) in squash(action)
 
 
 def _blocks(events: list[Event], request: MonitorRequest) -> list[str]:
@@ -164,21 +207,23 @@ class SlidingWindowMonitor:
             request.task_description, "", "", _CUT_HISTORY,
             objectives=request.objectives,
         )
-        *tokens, overhead = sizer.count([*blocks, empty])
         numbering = _ActionNumbering()
-        plans: list[ChunkPlan] = []
-        action_index = 0
+        targets: list[tuple[int, int]] = []   # (event position, Action N)
         for position, event in enumerate(events):
-            if event.kind not in ("tool_call", "agent_spawn"):
-                continue
-            number = numbering.next_for(event)
-            if event.kind != "tool_call":
-                continue
-            action = blocks[position]
-            history_budget = sizer.budget - overhead - tokens[position]
+            if event.kind in ("tool_call", "agent_spawn"):
+                number = numbering.next_for(event)
+                if event.kind == "tool_call":
+                    targets.append((position, number))
+        actions = [_action_text(events[position], number) for position, number in targets]
+        *tokens, overhead = sizer.count([*blocks, empty])
+        action_tokens = sizer.count(actions)
+        plans: list[ChunkPlan] = []
+        for action_index, ((position, number), action) in enumerate(zip(targets, actions, strict=True)):
+            event = events[position]
+            history_budget = sizer.budget - overhead - action_tokens[action_index]
             if history_budget < MIN_HISTORY_TOKENS:
                 raise ContextBudgetError(
-                    f"Action {number} (~{tokens[position]} tokens) leaves "
+                    f"Action {number} (~{action_tokens[action_index]} tokens) leaves "
                     f"~{history_budget} tokens of history in a "
                     f"{request.context_window}-token window; lower "
                     "--max-output-tokens or use a larger window"
@@ -197,7 +242,7 @@ class SlidingWindowMonitor:
                 has_actions=True,
                 user_prompt=user,
                 prompt_hash=hashlib.sha256(user.encode("utf-8")).hexdigest(),
-                prompt_tokens_est=overhead + history_tokens + tokens[position],
+                prompt_tokens_est=overhead + history_tokens + action_tokens[action_index],
                 event_start=events[first].event_id if included else event.event_id,
                 event_end=event.event_id,
                 event_count=included + 1,
@@ -208,10 +253,10 @@ class SlidingWindowMonitor:
                 action_number=number,
                 tool_name=event.tool_name,
                 tool_use_id=event.tool_use_id,
+                action_text=action,
                 history_events=included,
                 history_cut=cut,
             ))
-            action_index += 1
         for plan in plans:
             plan.view_chunk_total = len(plans)
         if not plans:
@@ -228,7 +273,10 @@ class SlidingWindowMonitor:
                 return cached
         response, score, reasoning = complete_and_parse(client, request, plan, journal)
         record = _chunk_record(request, plan, score, reasoning, response)
+        quote, quote_found = _quote(response.text, plan.action_text)
         record.update({
+            "quote": quote,
+            "quote_in_action": quote_found,
             "action_index": plan.action_index,
             "action_number": plan.action_number,
             "tool_name": plan.tool_name,
