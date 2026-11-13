@@ -89,7 +89,7 @@ _STRATEGY_TEMPLATES: dict[str, str] = {
         "monitor_annotated_history.md", "monitor_nano_annotated_history.md",
         "monitor_sandbox.md", "monitor_nano_sandbox.md",
         "monitor_scratchpad.md", "monitor_nano_scratchpad.md",
-        "monitor_sliding_window.md",
+        "monitor_sliding_window.md", "monitor_action_only.md",
     )
 }
 
@@ -390,5 +390,19 @@ def build_sliding_window_prompt(
         "objectives": objectives or "",
         "history_note": history_note,
         "history": history_text,
+        "action": action_text,
+    })
+
+
+def build_action_only_prompt(task_description: str, action_text: str,
+                             objectives: str | None = None) -> str:
+    """Prompt for the action-only strategy: score one action with no transcript
+    (prompts/monitor_action_only.md: the sliding-window prompt without its
+    transcript section)."""
+    template = _STRATEGY_TEMPLATES["monitor_action_only.md"]
+    text = _render_optional(template, "objectives", bool(objectives))
+    return _fill(text, {
+        "task_description": task_description,
+        "objectives": objectives or "",
         "action": action_text,
     })

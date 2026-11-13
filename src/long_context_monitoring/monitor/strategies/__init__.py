@@ -1,4 +1,5 @@
 """The monitoring strategies included in this release."""
+from long_context_monitoring.monitor.strategies.action_only import ActionOnlyMonitor
 from long_context_monitoring.monitor.strategies.annotated_history import AnnotatedHistoryMonitor
 from long_context_monitoring.monitor.strategies.base import ContextBudgetError, MonitorRequest, MonitorStrategy
 from long_context_monitoring.monitor.strategies.hierarchical_summary import HierarchicalSummaryMonitor
@@ -18,6 +19,7 @@ STRATEGIES: dict[str, MonitorStrategy] = {
     "sandbox": SandboxMonitor(),
     "scratchpad": ScratchpadMonitor(),
     "sliding-window": SlidingWindowMonitor(),
+    "action-only": ActionOnlyMonitor(),
 }
 DEFAULT_STRATEGY = "intervals"
 __all__ = ["ContextBudgetError", "MonitorRequest", "MonitorStrategy", "STRATEGIES", "DEFAULT_STRATEGY", "get_strategy"]
